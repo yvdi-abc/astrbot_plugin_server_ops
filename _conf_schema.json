@@ -1,0 +1,32 @@
+{
+  "require_admin": {
+    "description": "是否仅管理员（或在 allowed_user_ids 白名单中）可使用本插件的工具",
+    "type": "bool",
+    "default": true,
+    "hint": "建议保持开启。关闭后任何用户都能让机器人读取系统状态/日志，有信息泄露风险"
+  },
+  "allowed_user_ids": {
+    "description": "额外允许使用工具的用户 ID 列表（QQ 号等，可在 AstrBot 中用 /sid 查看自己的 ID）",
+    "type": "list",
+    "default": [],
+    "hint": "例如 [\"3625607718\"]"
+  },
+  "command_timeout": {
+    "description": "命令执行超时（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "防止命令卡死占用机器人"
+  },
+  "log_roots": {
+    "description": "server_log_view 允许查看的日志根目录列表（绝对路径）",
+    "type": "list",
+    "default": ["/var/log", "/tmp"],
+    "hint": "AstrBot 数据目录自动包含，无需填写"
+  },
+  "gsuid_process": {
+    "description": "gsuid_core 进程匹配关键字（用于 gsuid_status 工具）",
+    "type": "string",
+    "default": "gsuid_core",
+    "hint": "例如 gsuid_core"
+  }
+}
