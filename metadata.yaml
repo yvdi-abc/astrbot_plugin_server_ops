@@ -1,0 +1,6 @@
+name: astrbot_plugin_server_ops
+display_name: 服务器管理工具包
+desc: 为 AstrBot 提供安全的服务器/电脑控制能力：系统状态、磁盘、进程、systemd 服务管理、日志查看、安全 shell 执行、AstrBot 与 gsuid_core 状态，以及已安装插件能力索引。全部封装为 LLM 工具，机器人可在对话中直接调用。
+short_desc: 服务器管理工具包（LLM 工具 + 指令）
+version: v1.0.0
+author: yvdi-abc
