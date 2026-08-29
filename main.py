@@ -22,6 +22,7 @@
 - 所有命令执行带超时，防止卡死。
 """
 
+import asyncio
 import os
 import re
 import subprocess
@@ -33,44 +34,70 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 # --------------------------------------------------------------------------- #
-# 危险命令黑名单（与 AstrBot 内置 local computer-use 保持一致并加强）          #
+# 安全命令校验（白名单 + 拒绝 shell 元字符 + 拒绝危险命令前缀）               #
 # --------------------------------------------------------------------------- #
-_BLOCKED_PATTERNS = [
-    " rm -rf ",
-    " rm -fr ",
-    " rm -r ",
-    " mkfs",
-    " dd if=",
-    " shutdown",
-    " reboot",
-    " poweroff",
-    " halt",
-    " sudo ",
-    ":(){:|:&};:",
-    " kill -9 ",
-    " killall",
-    " pkill",
-    " chmod -r",
-    " chown ",
-    " > /dev/sda",
-    " mkfs.",
-    " fdisk",
-    " parted ",
-    " > /etc/passwd",
-    " : > ",
-    " git push --force",
-    " rm -R",
-]
 
 _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@:+-]+$")
 
+# 允许执行的"安全只读命令"白名单（argv[0] 匹配，前缀命令如 systemctl status 也安全）
+_SAFE_COMMANDS = {
+    "ls", "cat", "head", "tail", "df", "free", "ps", "uptime", "whoami",
+    "hostname", "uname", "date", "echo", "pwd", "which", "du", "stat",
+    "systemctl", "ss", "netstat", "dmesg", "id", "env", "grep", "wc",
+    "find", "getent", "journalctl", "top", "htop", "vmstat", "iostat",
+}
+
+# 明确禁止的破坏性/危险命令前缀（即使被白名单漏过也拦截）
+_BLOCKED_COMMAND_PREFIXES = (
+    "rm ", "mv ", "cp ", "chmod ", "chown ", "mkfs", "dd ", "fdisk", "parted",
+    "shutdown", "reboot", "poweroff", "halt", "sudo", "su ", "kill", "pkill",
+    "killall", "systemctl stop", "systemctl start", "systemctl restart",
+    "systemctl disable", "systemctl enable", "systemctl kill", "mount ", "umount",
+    ">", ">>", "|", "&", ";", "`", "$(", "&&", "||", "python", "bash ", "sh ",
+    "curl", "wget", "nc ", "telnet", "openssl", "git push", "make install",
+    "apt ", "yum ", "dnf ", "pip install", "npm install",
+)
+
+# 禁止出现的 shell 元字符（任何形式）
+_SHELL_METACHARS = set(";&|`$<>(){}!*?[]'\"\\\n\t\r")
+
+
+def _normalize_command(command: str) -> str:
+    """规范化命令：折叠空白、去除首尾。"""
+    return re.sub(r"\s+", " ", command).strip()
+
 
 def _is_safe_command(command: str) -> bool:
-    """检查命令是否安全（不含危险子串）。"""
+    """严格校验命令是否安全。
+
+    策略：白名单命令 + 拒绝 shell 元字符 + 拒绝危险命令前缀。
+    - 只允许白名单内的命令二进制（ls/cat/df/free/ps 等只读命令）
+    - 拒绝所有 shell 元字符（; & | > < ` $ () {} * ? 引号 换行 反斜杠等）
+    - 拒绝危险命令前缀（rm/mv/sudo/kill/系统管理/下载安装等）
+    """
     if not command or not command.strip():
         return False
-    cmd = f" {command.strip().lower()} "
-    return not any(pat in cmd for pat in _BLOCKED_PATTERNS)
+    cmd = _normalize_command(command)
+
+    # 1. 拒绝任何 shell 元字符
+    for ch in cmd:
+        if ch in _SHELL_METACHARS:
+            return False
+
+    # 2. 检查首词是否在白名单（前缀匹配：systemctl status 的 systemctl 在白名单）
+    parts = cmd.split(" ")
+    first = parts[0].lower()
+    if first not in _SAFE_COMMANDS:
+        return False
+
+    # 3. 拒绝危险命令前缀（双保险）
+    lowered = cmd.lower()
+    for prefix in _BLOCKED_COMMAND_PREFIXES:
+        if lowered.startswith(prefix) or f" {prefix}" in lowered:
+            return False
+
+    # 4. 拒绝路径操作（rm/mv 等已在上方拦截，这里拒绝写文件的重定向已在元字符拦截）
+    return True
 
 
 class Main(star.Star):
@@ -110,36 +137,43 @@ class Main(star.Star):
     # 命令执行助手                                                       #
     # ------------------------------------------------------------------ #
 
-    def _run_cmd(
+    async def _run_cmd(
         self,
         cmd: str,
         timeout: int = None,
         cwd: str = None,
     ) -> dict:
-        """执行 shell 命令，返回 {ok, stdout, stderr, code}。输出截断防超长。"""
+        """异步执行 shell 命令，返回 {ok, stdout, stderr, code}。输出截断防超长。
+
+        使用 asyncio.create_subprocess_shell 避免阻塞事件循环。
+        """
         timeout = timeout or int(self.config.get("command_timeout", 20) or 20)
         try:
-            result = subprocess.run(
+            proc = await asyncio.create_subprocess_shell(
                 cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env={**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"},
             )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": f"命令执行超时（>{timeout}s），已终止。",
+                    "code": -1,
+                }
             return {
-                "ok": True,
-                "stdout": (result.stdout or "")[-4000:],
-                "stderr": (result.stderr or "")[-2000:],
-                "code": result.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "stdout": "",
-                "stderr": f"命令执行超时（>{timeout}s），已终止。",
-                "code": -1,
+                "ok": proc.returncode == 0,
+                "stdout": (stdout or b"").decode("utf-8", errors="replace")[-4000:],
+                "stderr": (stderr or b"").decode("utf-8", errors="replace")[-2000:],
+                "code": proc.returncode,
             }
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "stdout": "", "stderr": str(e), "code": -2}
@@ -186,7 +220,7 @@ class Main(star.Star):
                 return total, idle
 
             t1, i1 = _cpu()
-            time.sleep(0.2)
+            await asyncio.sleep(0.2)
             t2, i2 = _cpu()
             total_delta = max(t2 - t1, 1)
             idle_delta = i2 - i1
@@ -224,9 +258,9 @@ class Main(star.Star):
             uptime_str = "?"
 
         # 磁盘
-        disk = self._run_cmd("df -h / /root /home 2>/dev/null | head -20", timeout=10)
+        disk = await self._run_cmd("df -h / /root /home 2>/dev/null | head -20", timeout=10)
 
-        hostname = self._run_cmd("hostname 2>/dev/null", timeout=5)["stdout"].strip()
+        hostname = (await self._run_cmd("hostname 2>/dev/null", timeout=5))["stdout"].strip()
         cpu_line = f"CPU: {cpu_pct}%" if cpu_pct is not None else "CPU: 读取失败"
 
         return (
@@ -244,7 +278,7 @@ class Main(star.Star):
         if not self._has_perm(event):
             return self._denied("磁盘查看")
 
-        df = self._run_cmd("df -h 2>/dev/null | head -30", timeout=10)
+        df = await self._run_cmd("df -h 2>/dev/null | head -30", timeout=10)
         return self._fmt(df, "【磁盘使用】")
 
     @llm_tool(name="server_process_list")
@@ -263,10 +297,14 @@ class Main(star.Star):
         if not self._has_perm(event):
             return self._denied("进程查看")
 
-        count = max(1, min(int(count or 15), 50))
+        try:
+            count = int(count or 15)
+        except (TypeError, ValueError):
+            count = 15
+        count = max(1, min(count, 50))
         key = "pcpu" if str(sort_by).lower() in ("cpu", "pcpu") else "pmem"
         cmd = f"ps -eo pid,user,pcpu,pmem,rss,comm --sort=-{key} 2>/dev/null | head -{count + 1}"
-        r = self._run_cmd(cmd, timeout=10)
+        r = await self._run_cmd(cmd, timeout=10)
         return self._fmt(r, f"【进程 TOP {count}（按 {key} 排序）】")
 
     # ------------------------------------------------------------------ #
@@ -293,7 +331,7 @@ class Main(star.Star):
         if action == "list":
             if not self._has_perm(event):
                 return self._denied("服务列表查看")
-            r = self._run_cmd("systemctl list-units --type=service --no-pager 2>/dev/null | head -40", timeout=15)
+            r = await self._run_cmd("systemctl list-units --type=service --no-pager 2>/dev/null | head -40", timeout=15)
             return self._fmt(r, "【系统服务列表】")
 
         service = str(service or "").strip()
@@ -310,7 +348,7 @@ class Main(star.Star):
                 return self._denied("服务状态查看")
 
         cmd = f"systemctl {action} {service} --no-pager 2>&1 | head -30"
-        r = self._run_cmd(cmd, timeout=30)
+        r = await self._run_cmd(cmd, timeout=30)
         return self._fmt(r, f"【systemctl {action} {service}】")
 
     # ------------------------------------------------------------------ #
@@ -333,7 +371,11 @@ class Main(star.Star):
         if not self._has_perm(event):
             return self._denied("日志查看")
 
-        lines = max(1, min(int(lines or 50), 200))
+        try:
+            lines = int(lines or 50)
+        except (TypeError, ValueError):
+            lines = 50
+        lines = max(1, min(lines, 200))
         raw = str(path or "").strip()
         if not raw:
             return "请提供日志文件路径。"
@@ -343,9 +385,9 @@ class Main(star.Star):
         except Exception:
             return f"路径解析失败：{raw}"
 
-        # 允许的根目录
+        # 允许的根目录（默认不含 /root，避免非管理员读取敏感文件）
         astrbot_data = str(Path(get_astrbot_data_path()).resolve())
-        roots = [astrbot_data, "/var/log", "/tmp", "/root"]
+        roots = [astrbot_data, "/var/log", "/tmp"]
         for extra in (self.config.get("log_roots") or []):
             try:
                 roots.append(str(Path(str(extra)).expanduser().resolve()))
@@ -359,10 +401,18 @@ class Main(star.Star):
                 "可在插件配置 log_roots 中增加允许的目录。"
             )
 
+        # 敏感目录（/root、/etc、/home）下的文件读取强制要求管理员
+        if str(p).startswith(("/root/", "/etc/", "/home/")) and not event.is_admin():
+            return "该路径位于敏感目录（/root、/etc、/home），仅限管理员读取。"
+
         if not p.exists() or not p.is_file():
             return f"文件不存在或不是普通文件：{p}"
 
-        r = self._run_cmd(f"tail -n {lines} '{p}' 2>&1", timeout=10)
+        import shlex
+
+        r = await self._run_cmd(
+            f"tail -n {int(lines)} {shlex.quote(str(p))} 2>&1", timeout=10
+        )
         return self._fmt(r, f"【{p} 末尾 {lines} 行】")
 
     # ------------------------------------------------------------------ #
@@ -384,12 +434,13 @@ class Main(star.Star):
             return "请提供要执行的命令。"
         if not _is_safe_command(cmd):
             return (
-                "该命令包含危险操作，已被拦截。禁止的命令包括：rm -rf / rm -fr、sudo、"
-                "shutdown/reboot/poweroff/halt、mkfs/fdisk/parted、dd if=、kill -9/pkill/killall 等。\n"
+                "该命令不满足安全策略，已被拦截。仅允许执行只读命令（如 ls/cat/df/free/ps/"
+                "uptime/systemctl status/ss 等），禁止 shell 元字符（; & | > < ` $）与危险操作"
+                "（rm/mv/sudo/kill/关机重启/格式化/下载安装等）。\n"
                 "如需这些操作，请直接在服务器上手动执行。"
             )
 
-        r = self._run_cmd(cmd, timeout=int(self.config.get("command_timeout", 20) or 20))
+        r = await self._run_cmd(cmd, timeout=int(self.config.get("command_timeout", 20) or 20))
         return self._fmt(r, f"【执行: {cmd}】")
 
     # ------------------------------------------------------------------ #
@@ -508,15 +559,15 @@ class Main(star.Star):
         except Exception:
             ver = "?"
 
-        pid_info = self._run_cmd(
+        pid_info = await self._run_cmd(
             "ps -eo pid,rss,etime,cmd | grep -i 'astrbot.cli' | grep -v grep | head -3",
             timeout=10,
         )
-        plugins = self._run_cmd(
+        plugins = await self._run_cmd(
             f"ls -d {Path(get_astrbot_data_path()) / 'plugins'}/*/ 2>/dev/null | wc -l",
             timeout=10,
         )
-        data_size = self._run_cmd(
+        data_size = await self._run_cmd(
             f"du -sh {Path(get_astrbot_data_path())} 2>/dev/null | cut -f1",
             timeout=30,
         )
@@ -537,11 +588,11 @@ class Main(star.Star):
             return self._denied("gsuid_core 状态查看")
 
         keyword = str(self.config.get("gsuid_process", "gsuid_core") or "gsuid_core")
-        proc = self._run_cmd(
+        proc = await self._run_cmd(
             f"ps -eo pid,etime,rss,cmd | grep '{keyword}' | grep -v grep | head -5",
             timeout=10,
         )
-        port = self._run_cmd("ss -tlnp 2>/dev/null | grep -iE 'python|gsuid' | head -10", timeout=10)
+        port = await self._run_cmd("ss -tlnp 2>/dev/null | grep -iE 'python|gsuid' | head -10", timeout=10)
 
         return (
             f"【gsuid_core 状态】（匹配关键字: {keyword}）\n"
