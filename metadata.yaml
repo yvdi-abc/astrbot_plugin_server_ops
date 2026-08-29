@@ -4,3 +4,4 @@ desc: 为 AstrBot 提供安全的服务器/电脑控制能力：系统状态、�
 short_desc: 服务器管理工具包（LLM 工具 + 指令）
 version: v1.0.0
 author: yvdi-abc
+astrbot_version: ">=4.16,<5"
