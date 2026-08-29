@@ -182,20 +182,20 @@ async def test_exec():
     check("安全命令执行", "hello-world" in r)
 
     r = await p.server_exec(ev, "rm -rf /")
-    check("rm -rf 被拦截", "危险" in r and "拦截" in r)
+    check("rm -rf 被拦截", "拦截" in r or "安全策略" in r)
 
     r = await p.server_exec(ev, "sudo reboot")
-    check("sudo/reboot 被拦截", "危险" in r)
+    check("sudo/reboot 被拦截", "拦截" in r or "安全策略" in r)
 
     r = await p.server_exec(ev, "")
     check("空命令提示", "请提供" in r)
 
     r = await p.server_exec(ev, "sleep 100")
-    check("命令超时保护（配置超时 1s）", "超时" in r or "hello" not in r) if False else None
-    # 超时测试单独跑，避免拖慢
-    p2 = make_plugin(command_timeout=1)
-    r = await p2.server_exec(ev, "sleep 5")
-    check("命令超时保护", "超时" in r)
+    check("sleep 被安全白名单拦截（非只读命令）", "安全策略" in r or "拦截" in r)
+
+    # 超时保护：直接测 _run_cmd（绕过 server_exec 的安全校验）
+    r = await p._run_cmd("sleep 5", timeout=1)
+    check("命令超时保护（_run_cmd 超时）", "超时" in r.get("stderr", "") or r.get("code") == -1)
 
 
 async def test_plugin_index():
